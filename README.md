@@ -1,5 +1,7 @@
 # quick start
 
+[install uv](https://docs.astral.sh/uv/getting-started/installation/)
+
 语音转文字
 
 ```bash
