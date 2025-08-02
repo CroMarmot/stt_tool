@@ -1,0 +1,29 @@
+[project]
+name = "stt"
+version = "0.1.0"
+description = "Speech to text tool based on whisper"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai-whisper>=20250625",
+    "pydub>=0.25.1",
+    "rich>=14.1.0",
+    "torch>=2.7.1",
+    "torchaudio>=2.7.1",
+    "typer>=0.16.0",
+    "vosk>=0.3.45",
+]
+
+[dependency-groups]
+dev = ["ruff>=0.12.7"]
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = ["D", "E501", "G004", "RUF001", "RUF003", "ANN201", "B904"]
+fixable = ["ALL"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]

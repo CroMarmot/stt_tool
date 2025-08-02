@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+*.mp3
+*.m4a
+*.wav
+*.srt
+*.txt
+*.zip
+vosk-model-*
