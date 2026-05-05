@@ -1,0 +1,21 @@
+target-version = "py310"
+line-length = 120
+
+[lint]
+select = ["ALL"]
+ignore = [
+    "D",      # pydocstyle - 文档字符串检查（CLI 工具暂不启用）
+    "E501",   # pycodestyle - 行长度（交给 formatter 处理）
+    "RUF001", # Ruff - 字符串中包含易混淆的 Unicode 字符
+    "RUF003", # Ruff - 注释中包含易混淆的 Unicode 字符
+    "ANN",    # 类型注解（暂不强制）
+    "COM812", # 尾随逗号与 formatter 冲突
+    "ARG005", # typer callback 未使用参数
+    "B008",   # typer Option 默认参数模式
+]
+fixable = ["ALL"]
+
+[format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"

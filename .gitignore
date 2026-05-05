@@ -5,13 +5,42 @@ build/
 dist/
 wheels/
 *.egg-info
+.pytest_cache/
+.ruff_cache/
 
 # Virtual environments
-.venv
+.venv/
+
+# =============================================
+# Audio & Transcription files
+# =============================================
 *.mp3
 *.m4a
 *.wav
+*.flac
+*.ogg
 *.srt
 *.txt
-*.zip
-vosk-model-*
+*.vtt
+*.json
+
+# =============================================
+# Model files
+# =============================================
+
+# Whisper models (large ~10GB)
+*.pt
+*.bin
+
+# Hugging Face models / transformers cache
+*.safetensors
+
+# =============================================
+# OS & Editor files
+# =============================================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~

@@ -6,6 +6,7 @@ import logging
 import os
 from pathlib import Path
 
+import torch
 import typer
 import whisper
 from rich.console import Console
@@ -27,12 +28,12 @@ MODEL_SIZE = "small"
 # 初始化 rich（仅用于 info 命令）
 console = Console()
 
-# 配置 logging，包含时间戳
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+logger = logging.getLogger(__name__)
 
 app = typer.Typer(
     name="whisper-transcribe",
@@ -45,7 +46,7 @@ app = typer.Typer(
 def validate_audio_path(value: str) -> Path:
     path = Path(value)
     if not path.exists():
-        logging.error(f"文件不存在：{path}")
+        logger.error("文件不存在：%s", path)
         raise typer.Exit(1)
     return path
 
@@ -71,15 +72,11 @@ def transcribe(
             "large-v2",
         ],
     ),
-    output: Path | None = typer.Option(
-        None, "--output", "-o", help="📁 输出目录（默认为当前目录）"
-    ),
-    language: str = typer.Option(
-        "zh", "--language", "-l", help="🌐 语言代码（zh=中文）"
-    ),
+    output: Path | None = typer.Option(None, "--output", "-o", help="📁 输出目录（默认为当前目录）"),
+    language: str = typer.Option("zh", "--language", "-l", help="🌐 语言代码（zh=中文）"),
 ):
     """
-    转录音频并生成 SRT、TXT、JSON 等格式
+    转录音频并生成 SRT 字幕格式
     """
     audio_path = validate_audio_path(audio)
 
@@ -87,48 +84,40 @@ def transcribe(
     output_dir = output or Path()
     output_dir.mkdir(exist_ok=True)
 
-    # 开始信息（使用 logging 输出带时间戳）
-    logging.info(f"开始处理音频：{audio_path.name} | 模型：{model} | 语言：{language}")
+    logger.info("开始处理音频：%s | 模型：%s | 语言：%s", audio_path.name, model, language)
 
-    # 加载模型
     try:
-        logging.info(f"正在加载模型 '{model}'...")
+        logger.info("正在加载模型 '%s'...", model)
         model_obj = whisper.load_model(model, download_root=WHISPER_DOWNLOAD_ROOT)
-    except Exception:
-        logging.exception("加载模型失败：")
-        raise typer.Exit(1)
 
-    # 转录
+        device_type = model_obj.device.type
+        if device_type == "cuda":
+            device_name = torch.cuda.get_device_name(model_obj.device)
+            device_info = f"GPU: {device_name}"
+        elif device_type == "mps":
+            device_info = "Apple Silicon MPS"
+        else:
+            device_info = "CPU"
+        logger.info("计算设备：%s", device_info)
+    except Exception as err:
+        logger.exception("加载模型失败：")
+        raise typer.Exit(1) from err
+
     try:
-        logging.info("正在转录音频...")
+        logger.info("正在转录音频...")
         result = model_obj.transcribe(
             str(audio_path),
             language=language,
             word_timestamps=True,
-            verbose=TRANSCRIBE_VERBOSE,  # None 无输出 false 进度条, True 内容
+            verbose=TRANSCRIBE_VERBOSE,
         )
-    except Exception:
-        logging.exception("转录失败：")
-        raise typer.Exit(1)
+    except Exception as err:
+        logger.exception("转录失败：")
+        raise typer.Exit(1) from err
 
-    # 写入输出
     try:
-        logging.info("正在生成输出文件...")
-        # 只输出 txt 和 srt
-        txt_writer = get_writer("txt", str(output_dir))
+        logger.info("正在生成输出文件...")
         srt_writer = get_writer("srt", str(output_dir))
-
-        # 写入 txt
-        txt_writer(
-            result,
-            audio_path.stem + audio_path.suffix,
-            {
-                "highlight_words": False,
-                "max_line_width": None,
-                "max_line_count": None,
-            },
-        )
-        # 写入 srt
         srt_writer(
             result,
             audio_path.stem + audio_path.suffix,
@@ -138,14 +127,12 @@ def transcribe(
                 "max_line_count": None,
             },
         )
-    except Exception:
-        logging.exception("写入文件失败：")
-        raise typer.Exit(1)
+    except Exception as err:
+        logger.exception("写入文件失败：")
+        raise typer.Exit(1) from err
 
-    # 成功提示（使用 logging）
-    logging.info("转录完成！输出文件：")
-    logging.info(f"✅ TXT: {output_dir}/{audio_path.stem}.txt")
-    logging.info(f"✅ SRT: {output_dir}/{audio_path.stem}.srt")
+    logger.info("转录完成！输出文件：")
+    logger.info("✅ SRT: %s/%s.srt", output_dir, audio_path.stem)
 
 
 @app.command()
