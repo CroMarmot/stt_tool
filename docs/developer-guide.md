@@ -124,3 +124,13 @@ settings = Settings(transcribe_verbose=True)
 3. 提交变更
 4. 确保文档同步更新
 5. 提交 Pull Request
+
+
+## 本地模拟时，多用户共享文件夹rwx权限
+
+```bash
+# setfacl 感觉 需要-R 递归授权，否则没有递归
+# 所以还是考虑加用户组
+sudo usermod -aG <现在权限主用户组 > <远端测试用户名>
+# sudo usermod -aG esakura yexiaorain
+```

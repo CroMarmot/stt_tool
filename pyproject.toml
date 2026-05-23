@@ -7,16 +7,24 @@ requires-python = ">=3.10"
 dependencies = [
     "openai-whisper>=20250625",
     "rich>=14.1.0",
-    "torch>=2.7.1",
-    "torchaudio>=2.7.1",
+    "torch",
+    "torchaudio",
+    # "torchcodec",
     "typer>=0.16.0",
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
 ]
 
 [dependency-groups]
-dev = [
-    "ruff>=0.12.7",
-]
+dev = ["ruff>=0.12.7"]
 
+# 核心修改：强制 uv 从 NVIDIA CUDA 11.8 的官方源拉取 PyTorch 相关包
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu118", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cu118", marker = "sys_platform == 'linux'" }]
+torchaudio = [{ index = "pytorch-cu118", marker = "sys_platform == 'linux'" }]
 
+[[tool.uv.index]]
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true

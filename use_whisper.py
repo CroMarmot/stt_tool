@@ -8,24 +8,21 @@ import platform
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pydantic
 import pydantic_settings
 import torch
+import torchaudio
 import typer
 import whisper
 from pydantic_settings import BaseSettings
 from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeRemainingColumn,
-)
 from rich.table import Table
 from whisper.utils import WriteSRT
+
+from utils import filter_existing_files, get_mp3_files
 
 # 设置 Hugging Face 镜像与缓存路径
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
@@ -60,29 +57,11 @@ app = typer.Typer(
 
 
 def validate_input_path(value: str) -> Path:
-    path = Path(value)
+    path = Path(value).expanduser()
     if not path.exists():
         logger.error("路径不存在：%s", path)
         raise typer.Exit(1)
     return path
-
-
-def get_mp3_files(input_path: Path) -> list[Path]:
-    if input_path.is_file():
-        if input_path.suffix.lower() == ".mp3":
-            return [input_path]
-        logger.error("输入文件不是 MP3 格式：%s", input_path)
-        raise typer.Exit(1)
-    if input_path.is_dir():
-        mp3_files = list(input_path.glob("*.mp3"))
-        mp3_files.sort()
-        return mp3_files
-    return []
-
-
-def has_existing_srt(mp3_file: Path, output_dir: Path) -> bool:
-    srt_file = output_dir / (mp3_file.stem + ".srt")
-    return srt_file.exists()
 
 
 def write_srt_only(result, audio_name: str, output_dir: Path):
@@ -98,21 +77,13 @@ def write_srt_only(result, audio_name: str, output_dir: Path):
     )
 
 
-def filter_existing_files(mp3_files: list[Path], output_dir: Path) -> list[Path]:
-    files_to_process = []
-    for mp3_file in mp3_files:
-        if has_existing_srt(mp3_file, output_dir):
-            console.print(f"[dim]跳过已处理：[/dim] {mp3_file.name}")
-        else:
-            files_to_process.append(mp3_file)
-    return files_to_process
-
-
 def load_whisper_model(model_name: str):
     console.print(f"正在加载模型 '{model_name}'...")
+
     model_obj = whisper.load_model(model_name, download_root=settings.whisper_download_root)
 
     device_type = model_obj.device.type
+    console.print(f"模型加载到设备：[cyan]{device_type}[/cyan]")
     if device_type == "cuda":
         device_name = torch.cuda.get_device_name(model_obj.device)
         device_info = f"GPU: {device_name}"
@@ -124,44 +95,80 @@ def load_whisper_model(model_name: str):
     return model_obj
 
 
+def get_audio_duration(mp3_path: Path) -> float:
+    """获取音频时长(秒)"""
+    try:
+        waveform, sample_rate = torchaudio.load(str(mp3_path))
+        return waveform.shape[1] / sample_rate
+    except (OSError, RuntimeError):
+        # torchaudio 失败时尝试用 whisper 加载
+        audio = whisper.load_audio(str(mp3_path))
+        return len(audio) / whisper.audio.SAMPLE_RATE
+
+
+def format_duration(seconds: float) -> str:
+    """格式化时长为可读字符串"""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    if hours > 0:
+        return f"{hours}h{minutes}m{secs}s"
+    if minutes > 0:
+        return f"{minutes}m{secs}s"
+    return f"{secs}s"
+
+
 def process_files_with_progress(
     files_to_process: list[Path], model_obj, language: str, temp_dir: Path, output_dir: Path
 ):
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        TimeRemainingColumn(),
-        console=console,
-    ) as progress:
-        main_task = progress.add_task("[blue]总体进度", total=len(files_to_process))
+    total = len(files_to_process)
+    total_audio_duration = 0.0
+    total_process_time = 0.0
 
-        for mp3_file in files_to_process:
-            task_id = progress.add_task(f"[yellow]处理中：{mp3_file.name}", total=1)
+    for idx, mp3_file in enumerate(files_to_process, 1):
+        console.print(f"\n[bold blue]总体进度：{idx}/{total}[/bold blue]")
+        console.print(f"[yellow]处理中：{mp3_file.name}[/yellow]")
 
-            try:
-                result = model_obj.transcribe(
-                    str(mp3_file),
-                    language=language,
-                    word_timestamps=True,
-                    verbose=settings.transcribe_verbose,
-                )
+        # 获取音频时长
+        try:
+            audio_duration = get_audio_duration(mp3_file)
+        except (OSError, RuntimeError):
+            audio_duration = 0.0
 
-                write_srt_only(result, mp3_file.stem + mp3_file.suffix, temp_dir)
+        # 处理并计时
+        start_time = time.time()
+        try:
+            result = model_obj.transcribe(
+                str(mp3_file),
+                language=language,
+                word_timestamps=True,
+                verbose=settings.transcribe_verbose,
+            )
 
-                temp_srt = temp_dir / (mp3_file.stem + ".srt")
-                final_srt = output_dir / (mp3_file.stem + ".srt")
-                shutil.move(str(temp_srt), str(final_srt))
+            write_srt_only(result, mp3_file.stem + mp3_file.suffix, temp_dir)
 
-                progress.update(task_id, advance=1, description=f"[green]完成：{mp3_file.name}")
-                progress.update(main_task, advance=1)
-            except Exception:
-                progress.update(task_id, description=f"[red]失败：{mp3_file.name}")
-                logger.exception("处理文件失败：%s", mp3_file.name)
-                temp_srt = temp_dir / (mp3_file.stem + ".srt")
-                if temp_srt.exists():
-                    temp_srt.unlink()
+            temp_srt = temp_dir / (mp3_file.stem + ".srt")
+            final_srt = output_dir / (mp3_file.stem + ".srt")
+            shutil.move(str(temp_srt), str(final_srt))
+
+            console.print(f"[green]完成：{mp3_file.name}[/green]")
+        except Exception:
+            console.print(f"[red]失败：{mp3_file.name}[/red]")
+            logger.exception("处理文件失败：%s", mp3_file.name)
+            temp_srt = temp_dir / (mp3_file.stem + ".srt")
+            if temp_srt.exists():
+                temp_srt.unlink()
+        process_time = time.time() - start_time
+
+        # 更新统计
+        total_audio_duration += audio_duration
+        total_process_time += process_time
+
+        # 显示统计
+        console.print(
+            f"[cyan]已处理：音频 {format_duration(total_audio_duration)}，"
+            f"耗时 {format_duration(total_process_time)}[/cyan]"
+        )
 
 
 @app.command()
@@ -183,7 +190,7 @@ def transcribe(
             "large-v2",
         ],
     ),
-    output: Path | None = typer.Option(None, "--output", "-o", help="📁 输出目录（默认为当前目录）"),
+    output: Path = typer.Option("output", "--output", "-o", help="📁 输出目录（默认为当前目录）"),
     language: str = typer.Option("zh", "--language", "-l", help="🌐 语言代码（zh=中文）"),
 ):
     """
@@ -196,7 +203,7 @@ def transcribe(
         logger.error("未找到 MP3 文件")
         raise typer.Exit(1)
 
-    output_dir = output or Path()
+    output_dir = Path(output).expanduser()
     output_dir.mkdir(exist_ok=True)
 
     temp_dir = output_dir / ".temp"
@@ -281,6 +288,44 @@ def env():
             console.print(f"[red]nvidia-smi 出错: {e}[/red]")
     else:
         console.print("[yellow]未找到 nvidia-smi 命令[/yellow]")
+
+    # NVCC 信息
+    console.print("\n[bold cyan]=== NVCC 信息 ===[/bold cyan]")
+    nvcc_path = shutil.which("nvcc")
+    if nvcc_path:
+        try:
+            result = subprocess.run([nvcc_path, "--version"], check=False, capture_output=True, text=True, timeout=10)  # noqa: S603
+            if result.returncode == 0:
+                console.print(result.stdout)
+            else:
+                console.print("[yellow]nvcc 执行失败[/yellow]")
+                console.print(result.stderr)
+        except FileNotFoundError:
+            console.print("[yellow]未找到 nvcc 命令[/yellow]")
+        except OSError as e:
+            console.print(f"[red]nvcc 出错: {e}[/red]")
+    else:
+        console.print("[yellow]未找到 nvcc 命令[/yellow]")
+
+    # Triton 信息
+    console.print("\n[bold cyan]=== Triton 信息 ===[/bold cyan]")
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", "import torch; print(torch.cuda.is_available()); import triton; print('Triton OK')"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            console.print(result.stdout)
+        else:
+            console.print("[yellow]Triton 检查失败[/yellow]")
+            console.print(result.stderr)
+    except FileNotFoundError:
+        console.print("[yellow]未找到 Python 命令[/yellow]")
+    except OSError as e:
+        console.print(f"[red]Triton 检查出错: {e}[/red]")
 
     # 依赖版本
     console.print("\n[bold cyan]=== 依赖版本 ===[/bold cyan]")
