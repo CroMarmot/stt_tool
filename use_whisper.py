@@ -1,4 +1,4 @@
-# uv add torch torchaudio openai-whisper typer rich pydantic pydantic-settings
+# uv add torch torchaudio faster-whisper typer rich pydantic pydantic-settings
 # 模型: https://huggingface.co/openai/whisper-medium
 #     mirror: https://hf-mirror.com/openai/whisper-medium
 # huggingface 上,一个B是一个Billion
@@ -16,37 +16,25 @@ import pydantic_settings
 import torch
 import torchaudio
 import typer
-import whisper
-from pydantic_settings import BaseSettings
+from faster_whisper import WhisperModel
 from rich.console import Console
 from rich.table import Table
-from whisper.utils import WriteSRT
 
-from utils import filter_existing_files, get_mp3_files
+from config import settings
+from log_config import setup_logging
+from utils import filter_existing_files, format_temperatures, get_max_temperature, get_mp3_files
 
 # 设置 Hugging Face 镜像与缓存路径
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-os.environ["HF_HOME"] = "/data/.cache"
-os.environ["TRANSFORMERS_CACHE"] = "/data/.cache"
-
-
-class Settings(BaseSettings):
-    whisper_download_root: str = "/data/.cache/whisper"
-    transcribe_verbose: bool = False
-    default_model_size: str = "small"
-
-
-settings = Settings()
+os.environ["HF_ENDPOINT"] = settings.hf_endpoint
+os.environ["HF_HOME"] = settings.hf_home
+os.environ["TRANSFORMERS_CACHE"] = settings.transformers_cache
 
 # 初始化 rich
 console = Console()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger(__name__)
+# 设置日志
+setup_logging()
+logger = logging.getLogger(f"{settings.app_name}.use_whisper")
 
 app = typer.Typer(
     name="whisper-transcribe",
@@ -64,34 +52,69 @@ def validate_input_path(value: str) -> Path:
     return path
 
 
-def write_srt_only(result, audio_name: str, output_dir: Path):
-    srt_writer = WriteSRT(str(output_dir))
-    srt_writer(
-        result,
-        audio_name,
-        {
-            "highlight_words": False,
-            "max_line_width": None,
-            "max_line_count": None,
-        },
-    )
+def write_srt_only(segments, audio_name: str, output_dir: Path):
+    """将 faster-whisper 的 segments 写入 SRT 文件"""
+    srt_path = output_dir / f"{Path(audio_name).stem}.srt"
+
+    with open(srt_path, "w", encoding="utf-8") as f:
+        for i, segment in enumerate(segments, 1):
+            # 格式化时间戳: 00:00:00,000
+            start_hours = int(segment.start // 3600)
+            start_minutes = int((segment.start % 3600) // 60)
+            start_seconds = int(segment.start % 60)
+            start_millis = int((segment.start % 1) * 1000)
+
+            end_hours = int(segment.end // 3600)
+            end_minutes = int((segment.end % 3600) // 60)
+            end_seconds = int(segment.end % 60)
+            end_millis = int((segment.end % 1) * 1000)
+
+            start_str = f"{start_hours:02d}:{start_minutes:02d}:{start_seconds:02d},{start_millis:03d}"
+            end_str = f"{end_hours:02d}:{end_minutes:02d}:{end_seconds:02d},{end_millis:03d}"
+
+            f.write(f"{i}\n")
+            f.write(f"{start_str} --> {end_str}\n")
+            f.write(f"{segment.text.strip()}\n\n")
 
 
 def load_whisper_model(model_name: str):
     console.print(f"正在加载模型 '{model_name}'...")
 
-    model_obj = whisper.load_model(model_name, download_root=settings.whisper_download_root)
-
-    device_type = model_obj.device.type
-    console.print(f"模型加载到设备：[cyan]{device_type}[/cyan]")
-    if device_type == "cuda":
-        device_name = torch.cuda.get_device_name(model_obj.device)
+    # 确定计算设备
+    if torch.cuda.is_available():
+        device = "cuda"
+        device_name = torch.cuda.get_device_name(0)
         device_info = f"GPU: {device_name}"
-    elif device_type == "mps":
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
         device_info = "Apple Silicon MPS"
     else:
+        device = "cpu"
         device_info = "CPU"
+
     console.print(f"计算设备：[cyan]{device_info}[/cyan]")
+
+    # GPU 计算类型选择
+    # - GTX 10xx (Pascal, compute capability 6.x): 不支持 float16，只能用 float32
+    # - RTX 20xx (Turing, compute capability 7.5): 可用 float16
+    # - RTX 30xx / A10 / A100 (Ampere, compute capability 8.x): 推荐 int8_float16
+    # - RTX 40xx / H100 (Ada/Hopper, compute capability 9.x): 可用 bfloat16
+    compute_type = "float32"
+    if device == "cuda":
+        cap = torch.cuda.get_device_capability(0)
+        if cap[0] >= 8:  # Ampere or newer (8.x, 9.x)  # noqa: PLR2004
+            compute_type = "int8_float16"
+        elif cap[0] >= 7:  # Volta/Turing (7.x)  # noqa: PLR2004
+            compute_type = "float16"
+
+    # 加载 faster-whisper 模型
+    model_obj = WhisperModel(
+        model_name,
+        device=device,
+        compute_type=compute_type,
+        download_root=settings.whisper_download_root,
+    )
+
     return model_obj
 
 
@@ -125,8 +148,21 @@ def process_files_with_progress(
     total_audio_duration = 0.0
     total_process_time = 0.0
 
+    # 显示初始温度
+    initial_max_temp, initial_temps = get_max_temperature()
+    initial_temp_str = format_temperatures(initial_temps)
+    if initial_temp_str:
+        console.print(f"[cyan]硬件初始温度：{initial_temp_str}[/cyan]\n")
+
     for idx, mp3_file in enumerate(files_to_process, 1):
-        console.print(f"\n[bold blue]总体进度：{idx}/{total}[/bold blue]")
+        current_max_temp, current_temps = get_max_temperature()
+        temp_str = format_temperatures(current_temps)
+
+        progress_line = f"\n[bold blue]总体进度：{idx}/{total}[/bold blue]"
+        if temp_str:
+            progress_line += f" [cyan]{temp_str}[/cyan]"
+
+        console.print(progress_line)
         console.print(f"[yellow]处理中：{mp3_file.name}[/yellow]")
 
         # 获取音频时长
@@ -138,14 +174,19 @@ def process_files_with_progress(
         # 处理并计时
         start_time = time.time()
         try:
-            result = model_obj.transcribe(
+            # faster-whisper 的 transcribe 返回 (segments, info)
+            segments, info = model_obj.transcribe(
                 str(mp3_file),
                 language=language,
                 word_timestamps=True,
-                verbose=settings.transcribe_verbose,
+                vad_filter=True,
+                log_progress=True,
             )
 
-            write_srt_only(result, mp3_file.stem + mp3_file.suffix, temp_dir)
+            # 将 segments 转换为列表（因为 faster-whisper 返回的是生成器）
+            segments_list = list(segments)
+
+            write_srt_only(segments_list, mp3_file.stem + mp3_file.suffix, temp_dir)
 
             temp_srt = temp_dir / (mp3_file.stem + ".srt")
             final_srt = output_dir / (mp3_file.stem + ".srt")
@@ -165,10 +206,28 @@ def process_files_with_progress(
         total_process_time += process_time
 
         # 显示统计
+        efficiency = total_audio_duration / total_process_time if total_process_time > 0 else 0
         console.print(
             f"[cyan]已处理：音频 {format_duration(total_audio_duration)}，"
-            f"耗时 {format_duration(total_process_time)}[/cyan]"
+            f"耗时 {format_duration(total_process_time)}，"
+            f"效率 {efficiency:.1f}x[/cyan]"
         )
+
+        # 检查温度（最后一个文件不需要等待）
+        if idx < total:
+            current_max_temp, current_temps = get_max_temperature()
+            while current_max_temp >= settings.temp_threshold and current_max_temp > 0:
+                temp_str = format_temperatures(current_temps)
+                console.print(f"[bold red]⚠️ 检测到高温！{temp_str}[/bold red]")
+                console.print(f"[bold red]触发过热保护，暂停计算并等待 {settings.temp_wait_minutes} 分钟...[/bold red]")
+                time.sleep(settings.temp_wait_minutes * 60)
+                current_max_temp, current_temps = get_max_temperature()
+
+    # 显示结束温度
+    final_max_temp, final_temps = get_max_temperature()
+    final_temp_str = format_temperatures(final_temps)
+    if final_temp_str:
+        console.print(f"\n[cyan]硬件结束温度：{final_temp_str}[/cyan]")
 
 
 @app.command()
@@ -330,7 +389,12 @@ def env():
     # 依赖版本
     console.print("\n[bold cyan]=== 依赖版本 ===[/bold cyan]")
     deps_table = Table("包名", "版本", show_lines=False)
-    deps_table.add_row("whisper", whisper.__version__)
+    try:
+        import faster_whisper
+
+        deps_table.add_row("faster-whisper", faster_whisper.__version__)
+    except ImportError:
+        deps_table.add_row("faster-whisper", "N/A")
     deps_table.add_row("torch", torch.__version__)
     deps_table.add_row("typer", typer.__version__)
     deps_table.add_row("pydantic", pydantic.__version__)

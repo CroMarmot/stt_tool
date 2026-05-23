@@ -1,5 +1,4 @@
 import logging
-import re
 import subprocess
 import time
 from pathlib import Path
@@ -10,6 +9,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
 from config import LOCAL_FILES_TO_UPLOAD, settings
+from log_config import setup_logging
 from utils import filter_existing_files, get_mp3_files
 
 app = typer.Typer(
@@ -20,7 +20,8 @@ app = typer.Typer(
 )
 
 console = Console()
-logger = logging.getLogger(settings.app_name)
+setup_logging()
+logger = logging.getLogger(f"{settings.app_name}.cloud_stt")
 
 
 def run_ssh_command_live(command: str) -> int:
@@ -28,48 +29,37 @@ def run_ssh_command_live(command: str) -> int:
     实时透传远端终端输出，不捕获任何结果。
     适用于需要查看动态进度条、复杂终端动效的场景。
     """
-    # 使用 -t 强制分配伪终端，保证远端的 rich 进度条、颜色和清屏动效能正常渲染
     ssh_cmd = ["ssh", "-t", settings.ssh_alias, command]
     console.print(f"[dim]$ {' '.join(ssh_cmd)}[/dim]")
 
-    # 核心修改：将 stdout 和 stderr 都设为 None
-    # 这会让子进程（ssh）直接继承当前 Python 程序的终端输入输出
     proc = subprocess.run(
         ssh_cmd,
-        stdout=None,  # 直接输出到本地终端，不经过管道
-        stderr=None,  # 直接输出到本地终端，不经过管道
+        stdout=None,
+        stderr=None,
         text=True,
-        stdin=None,  # 允许本地键盘输入直接传给远端（如果需要交互的话）
+        stdin=None,
     )
 
-    # 直接返回远端命令的退出码
     return proc.returncode
 
 
 def run_ssh_command(command: str) -> tuple[int, str, str]:
-    # ssh 命令添加 -n 参数：这个参数告诉 ssh 不要从标准输入读取任何内容。这是解决此类后台任务挂起问题的标准做法。
-    # Python 代码中添加 stdin=subprocess.DEVNULL：这显式地将子进程的 stdin 重定向到一个空设备（类似 Unix/Linux 中的 /dev/null）。这确保了 ssh 进程的 stdin 是一个已知关闭的流，从而避免其因等待输入而挂起。
-    # 使用 -t 分配伪终端，保证远程的 rich 进度条和颜色能正常显示
     ssh_cmd = ["ssh", "-n", "-t", settings.ssh_alias, command]
     console.print(f"[dim]$ {' '.join(ssh_cmd)}[/dim]")
 
-    # 改用 Popen 启动进程
     proc = subprocess.Popen(
         ssh_cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,  # 关键修改：直接丢弃 stderr，不捕获也不打印
+        stderr=subprocess.DEVNULL,
         text=True,
-        stdin=subprocess.DEVNULL,  # 依然保持 stdin 关闭，防止挂起
+        stdin=subprocess.DEVNULL,
     )
 
-    # 使用 communicate() 安全地读取 stdout 并等待进程结束
-    # 因为 stderr 被丢弃了，这里只需要接收 stdout
     stdout, _ = proc.communicate()
 
     if stdout:
         console.print(stdout)
 
-    # 返回空字符串作为 stderr，保持函数接口不变
     return proc.returncode, stdout, ""
 
 
@@ -86,7 +76,7 @@ def scp_file(local_path: Path, remote_path: str, upload: bool = True):
         console.print(f"[yellow]{result.stderr}[/yellow]")
 
 
-def setup_remote_server():
+def setup_remote_server(no_uv: bool = False):
     console.print("[bold cyan]正在设置远程服务器...[/bold cyan]")
 
     commands = [
@@ -105,6 +95,14 @@ def setup_remote_server():
         if Path(f).exists():
             console.print(f"上传文件: {f}")
             scp_file(Path(f), str(settings.remote_work_path), upload=True)
+
+    console.print("[cyan]上传远端 CUDA 11 配置文件...[/cyan]")
+    cuda11_config = Path(__file__).parent / "pyproject.cuda11.toml"
+    if cuda11_config.exists():
+        scp_file(cuda11_config, str(settings.remote_work_path / "pyproject.toml"), upload=True)
+        console.print("[green]✓ CUDA 11 配置文件已上传[/green]")
+    else:
+        console.print("[yellow]⚠ pyproject.cuda11.toml 未找到，跳过[/yellow]")
 
     console.print("[bold cyan]基础文件上传完成[/bold cyan]")
 
@@ -125,42 +123,56 @@ def setup_remote_server():
             raise typer.Exit(1)
         console.print("[green]ffmpeg 安装完成[/green]")
 
-    console.print("[bold cyan]检查并安装 uv...[/bold cyan]")
-    check_uv_cmd = 'export PATH="$HOME/.local/bin:$PATH" && which uv || echo "not_found"'
-    code, stdout, stderr = run_ssh_command(check_uv_cmd)
-    if "not_found" in stdout or code != 0:
-        console.print("[yellow]uv 未找到，正在安装...[/yellow]")
-        install_uv_cmd = "curl -LsSf https://astral.sh/uv/install.sh | sh"
-        with Progress(
-            SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console
-        ) as progress:
-            task = progress.add_task("安装 uv 中...", total=None)
-            code = run_ssh_command_live(install_uv_cmd)
-            progress.update(task, completed=True)
+    if no_uv:
+        console.print("[bold cyan]使用系统 pip 安装依赖（no-uv 模式）...[/bold cyan]")
+        install_cmd = f"cd {settings.remote_work_path} && pip install -e ."
+        console.print("[cyan]安装依赖中[/cyan]")
+        code = run_ssh_command_live(install_cmd)
         if code != 0:
-            console.print(f"[red]uv 安装失败: {stderr}[/red]")
+            console.print(f"[red]依赖安装失败[/red]")
             raise typer.Exit(1)
-        console.print("[green]uv 安装完成[/green]")
+        console.print("[bold green]系统 pip 依赖安装完成![/bold green]")
+    else:
+        console.print("[bold cyan]检查并安装 uv...[/bold cyan]")
+        check_uv_cmd = 'export PATH="$HOME/.local/bin:$PATH" && which uv || echo "not_found"'
+        code, stdout, stderr = run_ssh_command(check_uv_cmd)
+        if "not_found" in stdout or code != 0:
+            console.print("[yellow]uv 未找到，正在安装...[/yellow]")
+            install_uv_cmd = "curl -LsSf https://astral.sh/uv/install.sh | sh"
+            with Progress(
+                SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console
+            ) as progress:
+                task = progress.add_task("安装 uv 中...", total=None)
+                code = run_ssh_command_live(install_uv_cmd)
+                progress.update(task, completed=True)
+            if code != 0:
+                console.print(f"[red]uv 安装失败: {stderr}[/red]")
+                raise typer.Exit(1)
+            console.print("[green]uv 安装完成[/green]")
 
-    console.print("[bold cyan]安装项目依赖...[/bold cyan]")
-    install_cmd = f'export PATH="$HOME/.local/bin:$PATH" && cd {settings.remote_work_path} && rm -rf uv.lock && uv sync'
-    console.print("[cyan]安装依赖中[/cyan]")
-    code = run_ssh_command_live(install_cmd)
+        console.print("[bold cyan]安装项目依赖...[/bold cyan]")
+        install_cmd = (
+            f'export PATH="$HOME/.local/bin:$PATH" && cd {settings.remote_work_path} && rm -rf uv.lock && uv sync'
+        )
+        console.print("[cyan]安装依赖中[/cyan]")
+        code = run_ssh_command_live(install_cmd)
 
-    if code != 0:
-        console.print(f"[red]依赖安装失败[/red]")
-        console.print(stderr)
-        raise typer.Exit(1)
+        if code != 0:
+            console.print(f"[red]依赖安装失败[/red]")
+            console.print(stderr)
+            raise typer.Exit(1)
 
-    console.print("[bold green]远程服务器设置完成![/bold green]")
-    dep_list_cmd = f'export PATH="$HOME/.local/bin:$PATH" && cd {settings.remote_work_path} && uv pip list'
-    run_ssh_command(dep_list_cmd)
+        console.print("[bold green]远程服务器设置完成![/bold green]")
+        dep_list_cmd = f'export PATH="$HOME/.local/bin:$PATH" && cd {settings.remote_work_path} && uv pip list'
+        run_ssh_command(dep_list_cmd)
 
 
-def process_single_file(mp3_file: Path, output_dir: Path, model: str = "small"):
+def process_single_file(mp3_file: Path, output_dir: Path, model: str = "small", no_uv: bool = False):
     filename = mp3_file.name
     remote_mp3 = str(settings.remote_input_path / filename)
     remote_srt = str(settings.remote_output_path / f"{mp3_file.stem}.srt")
+
+    python_cmd = "python" if no_uv else "uv run python"
 
     try:
         console.print(f"[yellow]上传: {filename}[/yellow]")
@@ -170,7 +182,7 @@ def process_single_file(mp3_file: Path, output_dir: Path, model: str = "small"):
         process_cmd = (
             f'export PATH="$HOME/.local/bin:$PATH" && export LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH && '
             f"cd {settings.remote_work_path} && "
-            f"uv run python use_whisper.py transcribe "
+            f"{python_cmd} use_whisper.py transcribe "
             f'--model {model} --output "{settings.remote_output_path}" '
             f'"{remote_mp3}"'
         )
@@ -207,6 +219,7 @@ def transcribe(
         case_sensitive=False,
     ),
     output: Path = typer.Option("output", "--output", "-o", help="📁 本地输出目录"),
+    no_uv: bool = typer.Option(False, "--no-uv", help="不使用 uv 虚拟环境，直接用系统 pip"),
 ):
     """
     将音频发送到云服务器进行转录
@@ -231,16 +244,18 @@ def transcribe(
 
     console.print(f"[bold]找到 {len(files_to_process)} 个文件待处理[/bold]")
     console.print(f"[dim]SSH主机: {settings.ssh_alias}[/dim]")
-    console.print(f"[dim]远程工作目录: {settings.remote_work_path}[/dim]\n")
+    console.print(f"[dim]远程工作目录: {settings.remote_work_path}[/dim]")
+    console.print(f"[dim]运行模式: {'系统 pip' if no_uv else 'uv 虚拟环境'}[/dim]\n")
 
     total_files = len(files_to_process)
     total_process_time = 0.0
     success_count = 0
 
+    env_python = "python" if no_uv else "uv run python"
     env_cmd = (
         f'export PATH="$HOME/.local/bin:$PATH" && export LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH && '
         f"cd {settings.remote_work_path} && "
-        f"uv run python use_whisper.py env"
+        f"{env_python} use_whisper.py env"
     )
 
     run_ssh_command(env_cmd)
@@ -250,7 +265,7 @@ def transcribe(
     for idx, mp3_file in enumerate(files_to_process, 1):
         console.print(f"[bold blue]进度: {idx}/{total_files}[/bold blue]")
 
-        success, process_time = process_single_file(mp3_file, output_dir, model)
+        success, process_time = process_single_file(mp3_file, output_dir, model, no_uv)
 
         if success:
             success_count += 1
@@ -271,16 +286,11 @@ def transcribe(
 
 
 @app.command()
-def setup():
+def setup(no_uv: bool = typer.Option(False, "--no-uv", help="不使用 uv 虚拟环境，直接用系统 pip")):
     """
     仅设置远程服务器环境
     """
-    setup_remote_server()
+    setup_remote_server(no_uv=no_uv)
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 app()
