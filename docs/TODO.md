@@ -96,3 +96,8 @@ TLDR
   - 模型加载到设备：cuda
   - 计算设备：GPU: NVIDIA A10-4Q
   - 已处理：音频 56m55s，耗时 10m8s
+
+
+  coretemp的温度太不稳定了
+
+  watch -n 1 'for dir in /sys/class/hwmon/hwmon*; do echo "Device: $(cat $dir/name 2>/dev/null)"; for file in "$dir"/temp*_input; do if [ -f "$file" ]; then val=$(sudo cat "$file" 2>/dev/null); if [ -n "$val" ]; then echo "  -> $file: $(echo "scale=1; $val/1000" | bc)°C"; fi; fi; done; done'

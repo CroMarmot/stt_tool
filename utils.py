@@ -12,7 +12,9 @@ logger = logging.getLogger(f"{settings.app_name}.utils")
 console = Console()
 
 # 定义需要重点关注的传感器关键字（不区分大小写）
-CRITICAL_SENSORS = ["cpu", "package", "core", "pch", "nvme", "composite", "gpu"]
+# 注意：不包含 "core" 以排除不稳定的 coretemp
+# 添加 "acpi" 以包含稳定的 acpitz 传感器
+CRITICAL_SENSORS = ["cpu", "package", "pch", "nvme", "composite", "gpu", "acpi"]
 
 
 def get_mp3_files(input_path: Path) -> list[Path]:
